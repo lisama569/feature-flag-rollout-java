@@ -4,5 +4,7 @@ package com.github.lisama569.featureflagrolloutjava.config;
 public enum RejectionReason {
     STALE_BASE_VERSION,
     DUPLICATE_CHANGE_ID,
-    INVALID_ENTRIES
+    INVALID_ENTRIES,
+    /** 批次为空（没有任何可发布项）。 */
+    EMPTY_BATCH
 }

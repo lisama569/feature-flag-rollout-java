@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -41,6 +42,8 @@ public class ConfigService {
     private final Map<String, Long> sourceVersions = new ConcurrentHashMap<>();
     /** 已应用的 changeId，用于重复提交去重（幂等）。 */
     private final Set<String> appliedChangeIds = ConcurrentHashMap.newKeySet();
+    /** 各来源最近一次拉取健康状况，供值班总览展示降级状态。 */
+    private final Map<String, SourceHealth> healthBySource = new ConcurrentHashMap<>();
     private final ReentrantLock writeLock = new ReentrantLock();
 
     public ConfigService(List<ConfigSource> sources, ConfigValidator validator, AuditLog auditLog) {
@@ -49,6 +52,10 @@ public class ConfigService {
                 .toList();
         this.validator = validator;
         this.auditLog = auditLog;
+        for (ConfigSource source : this.sources) {
+            healthBySource.put(source.name(), new SourceHealth(
+                    source.name(), source.priority(), false, null, null, null, 0));
+        }
         this.current = new AtomicReference<>(
                 new ConfigSnapshot(0, Map.of(), Map.of(), System.currentTimeMillis()));
         refresh();
@@ -68,11 +75,23 @@ public class ConfigService {
 
             for (ConfigSource source : sources) {
                 Map<String, String> raw;
+                SourceHealth prev = healthBySource.getOrDefault(source.name(),
+                        new SourceHealth(source.name(), source.priority(), false, null, null, null, 0));
                 try {
                     raw = source.load();
                     lastGoodBySource.put(source.name(), Map.copyOf(raw));
+                    // 成功：清除降级标记，保留最近一次失败信息以便排查
+                    healthBySource.put(source.name(), new SourceHealth(
+                            source.name(), source.priority(), false,
+                            System.currentTimeMillis(),
+                            prev.lastFailureMillis(), prev.lastFailureReason(), raw.size()));
                 } catch (ConfigSourceUnavailableException e) {
                     Map<String, String> fallback = lastGoodBySource.get(source.name());
+                    int fallbackCount = fallback == null ? 0 : fallback.size();
+                    healthBySource.put(source.name(), new SourceHealth(
+                            source.name(), source.priority(), true,
+                            prev.lastSuccessMillis(), System.currentTimeMillis(),
+                            e.getMessage(), fallbackCount));
                     if (fallback == null) {
                         log.warn("[config-refresh] 来源={} 不可用且无历史快照，跳过该来源", source.name());
                         degraded.add(source.name() + "(no-snapshot)");
@@ -194,5 +213,242 @@ public class ConfigService {
 
     public AuditLog auditLog() {
         return auditLog;
+    }
+
+    /**
+     * 发布前试算：基于当前生效版本计算“假如现在提交”的合并预计结果。
+     *
+     * <p>边界保证：</p>
+     * <ul>
+     *   <li>只读当前快照，绝不修改生效配置、可回滚历史；</li>
+     *   <li>不写入 {@code appliedChangeIds}，不占用真实发布的幂等位置，也不写审计；</li>
+     *   <li>基准版本过期 / 内容非法 / 标识已真实发布过，分别返回可区分的拒绝原因，
+     *       {@code wouldApply=false}，{@code proposedVersion=null}，调用方不能误以为已生效。</li>
+     * </ul>
+     * 拒绝原因判定顺序与 {@link #submitChange} 保持一致：重复标识优先于过期基准。
+     */
+    public PreviewResult previewChange(ChangeRequest request) {
+        writeLock.lock();
+        try {
+            ConfigSnapshot before = current.get();
+            List<EntryDiff> diffs = buildDiffs(before.entries(), request.entries());
+            List<FlagImpact> impacts = buildFlagImpacts(before.entries(), request.entries());
+
+            RejectionReason reason = null;
+            String message;
+            List<ValidationError> errors = List.of();
+
+            if (appliedChangeIds.contains(request.changeId())) {
+                reason = RejectionReason.DUPLICATE_CHANGE_ID;
+                message = "试算结果: 该标识此前已真实发布过，再次提交会被拒绝（幂等），当前配置不会变化。changeId="
+                        + request.changeId();
+            } else if (request.baseVersion() != before.version()) {
+                reason = RejectionReason.STALE_BASE_VERSION;
+                message = "试算结果: 基准版本已过期，正式提交会被拒绝。baseVersion=" + request.baseVersion()
+                        + " 当前版本=" + before.version();
+            } else {
+                errors = validator.validate(request.entries());
+                if (!errors.isEmpty()) {
+                    reason = RejectionReason.INVALID_ENTRIES;
+                    message = "试算结果: 含 " + errors.size() + " 个非法配置项，正式提交会被整批拒绝；以下差异仅为对照，不会生效。";
+                } else {
+                    message = "试算结果: 校验通过，正式提交预计从版本 " + before.version()
+                            + " 升到 " + (before.version() + 1) + "，当前配置未被修改。";
+                }
+            }
+
+            boolean wouldApply = reason == null;
+            Long proposedVersion = wouldApply ? before.version() + 1 : null;
+            PreviewResult result = new PreviewResult(wouldApply, reason, message,
+                    request.baseVersion(), before.version(), proposedVersion,
+                    errors, List.copyOf(diffs), List.copyOf(impacts));
+            log.info("[config-preview] changeId={} | 依据: 当前版本={} baseVersion={} 拒绝原因={} 非法项={} 受影响开关={} | 结果: wouldApply={} 预计版本={}",
+                    request.changeId(), before.version(), request.baseVersion(), reason,
+                    errors.size(), impacts.stream().map(FlagImpact::flag).toList(),
+                    wouldApply, proposedVersion);
+            return result;
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    /** 逐项构造 当前值 vs 试算合并值 的差异（仅覆盖本次提交涉及的键）。 */
+    private List<EntryDiff> buildDiffs(Map<String, String> currentEntries, Map<String, String> proposed) {
+        List<EntryDiff> diffs = new ArrayList<>();
+        for (Map.Entry<String, String> e : proposed.entrySet()) {
+            String key = e.getKey();
+            String cur = currentEntries.get(key);
+            String next = e.getValue();
+            String changeType;
+            if (cur == null) {
+                changeType = "ADDED";
+            } else if (java.util.Objects.equals(cur, next)) {
+                changeType = "UNCHANGED";
+            } else {
+                changeType = "UPDATED";
+            }
+            diffs.add(new EntryDiff(key, cur, next, changeType));
+        }
+        return List.copyOf(diffs);
+    }
+
+    /** 计算本次提交涉及的 feature 开关在总开关与灰度比例上的前后变化。 */
+    private List<FlagImpact> buildFlagImpacts(Map<String, String> currentEntries, Map<String, String> proposed) {
+        Set<String> flags = new LinkedHashSet<>();
+        for (String key : proposed.keySet()) {
+            String flag = flagOf(key);
+            if (flag != null) {
+                flags.add(flag);
+            }
+        }
+        Map<String, String> projected = new LinkedHashMap<>(currentEntries);
+        projected.putAll(proposed);
+
+        List<FlagImpact> impacts = new ArrayList<>();
+        for (String flag : flags) {
+            Boolean enBefore = boolOrNull(currentEntries.get("feature." + flag + ".enabled"));
+            Integer pctBefore = intOrNull(currentEntries.get("feature." + flag + ".percentage"));
+            Boolean enAfter = boolOrNull(projected.get("feature." + flag + ".enabled"));
+            Integer pctAfter = intOrNull(projected.get("feature." + flag + ".percentage"));
+            boolean existed = currentEntries.containsKey("feature." + flag + ".enabled")
+                    || currentEntries.containsKey("feature." + flag + ".percentage");
+            boolean changed = !java.util.Objects.equals(enBefore, enAfter)
+                    || !java.util.Objects.equals(pctBefore, pctAfter);
+            String changeType = !existed ? "ADDED" : changed ? "UPDATED" : "UNCHANGED";
+            impacts.add(new FlagImpact(flag, enBefore, pctBefore, enAfter, pctAfter, changeType));
+        }
+        return List.copyOf(impacts);
+    }
+
+    /** 从配置键中解析开关名：feature.<name>.enabled / feature.<name>.percentage，否则 null。 */
+    public static String flagOf(String key) {
+        if (key == null || !key.startsWith("feature.")) {
+            return null;
+        }
+        if (key.endsWith(".enabled")) {
+            return key.substring("feature.".length(), key.length() - ".enabled".length());
+        }
+        if (key.endsWith(".percentage")) {
+            return key.substring("feature.".length(), key.length() - ".percentage".length());
+        }
+        return null;
+    }
+
+    private static Boolean boolOrNull(String raw) {
+        return raw == null ? null : Boolean.parseBoolean(raw.trim());
+    }
+
+    private static Integer intOrNull(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(raw.trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 批次原子发布：把多个开关的配置项作为一个整体提交。
+     *
+     * <p>原子性保证：任一必要项非法、基准版本过期、批次标识重复或批次为空时，整批拒绝，
+     * 不会出现任何一部分先生效；判定方在整个过程中只会看到完整的旧快照或完整的新快照
+     * （生效配置仍通过 {@link AtomicReference} 整体切换，写操作由同一把写锁串行化）。
+     * 成功发布只形成一个可回滚版本，审计记录整批内容、来源、操作者与前后版本。
+     * batchId 与单条 changeId 共用同一幂等空间。</p>
+     */
+    public ConfigSnapshot publishBatch(BatchPublishRequest request) throws ChangeRejectedException {
+        writeLock.lock();
+        try {
+            ConfigSnapshot before = current.get();
+
+            // 1) 先把整批展平为一个键集合；空批次直接拒绝，绝不部分生效。
+            Map<String, String> batchEntries = new LinkedHashMap<>();
+            if (request.items() != null) {
+                for (BatchPublishRequest.BatchItem item : request.items()) {
+                    if (item == null || item.flag() == null || item.flag().isBlank()
+                            || item.entries() == null) {
+                        auditLog.append(request.batchId(), request.source(), request.operator(),
+                                before.version(), before.version(), AuditRecord.Action.REJECTED,
+                                RejectionReason.INVALID_ENTRIES.name() + ": 批次项缺少 flag 或 entries",
+                                List.of());
+                        throw new ChangeRejectedException(RejectionReason.INVALID_ENTRIES,
+                                "批次包含非法条目（缺少 flag 或 entries）");
+                    }
+                    batchEntries.putAll(item.entries());
+                }
+            }
+
+            // 2) 幂等（与单条提交同一去重空间）
+            if (appliedChangeIds.contains(request.batchId())) {
+                auditLog.append(request.batchId(), request.source(), request.operator(),
+                        before.version(), before.version(), AuditRecord.Action.REJECTED,
+                        RejectionReason.DUPLICATE_CHANGE_ID.name(), List.of());
+                throw new ChangeRejectedException(RejectionReason.DUPLICATE_CHANGE_ID,
+                        "重复的批次提交: batchId=" + request.batchId());
+            }
+
+            // 3) 空批次
+            if (batchEntries.isEmpty()) {
+                auditLog.append(request.batchId(), request.source(), request.operator(),
+                        before.version(), before.version(), AuditRecord.Action.REJECTED,
+                        RejectionReason.EMPTY_BATCH.name(), List.of());
+                throw new ChangeRejectedException(RejectionReason.EMPTY_BATCH,
+                        "批次为空，没有任何可发布配置项: batchId=" + request.batchId());
+            }
+
+            // 4) 乐观并发基准
+            if (request.baseVersion() != before.version()) {
+                auditLog.append(request.batchId(), request.source(), request.operator(),
+                        before.version(), before.version(), AuditRecord.Action.REJECTED,
+                        RejectionReason.STALE_BASE_VERSION.name(), List.of());
+                throw new ChangeRejectedException(RejectionReason.STALE_BASE_VERSION,
+                        "批次基准版本过期: baseVersion=" + request.baseVersion()
+                                + " 当前版本=" + before.version());
+            }
+
+            // 5) 整批校验：有任何非法项，整批拒绝
+            List<ValidationError> errors = validator.validate(batchEntries);
+            if (!errors.isEmpty()) {
+                auditLog.append(request.batchId(), request.source(), request.operator(),
+                        before.version(), before.version(), AuditRecord.Action.REJECTED,
+                        RejectionReason.INVALID_ENTRIES.name(), List.copyOf(batchEntries.keySet()));
+                throw new ChangeRejectedException(RejectionReason.INVALID_ENTRIES,
+                        "批次包含非法配置项，整批不生效: " + errors, errors);
+            }
+
+            // 6) 全部检查通过后，一次性合并并整体切换：只产生一个新版本
+            Map<String, String> merged = new LinkedHashMap<>(before.entries());
+            merged.putAll(batchEntries);
+            ConfigSnapshot after = new ConfigSnapshot(before.version() + 1, merged,
+                    new HashMap<>(sourceVersions), System.currentTimeMillis());
+            current.set(after);
+            history.put(after.version(), after);
+            appliedChangeIds.add(request.batchId());
+            List<String> affectedKeys = List.copyOf(batchEntries.keySet());
+            auditLog.append(request.batchId(), request.source(), request.operator(),
+                    before.version(), after.version(), AuditRecord.Action.APPLIED,
+                    "BATCH items=" + request.items().size() + " keys=" + affectedKeys,
+                    affectedKeys);
+            log.info("[config-batch] batchId={} 来源={} 操作者={} 版本 {} -> {}，项数={} 整批键={}",
+                    request.batchId(), request.source(), request.operator(),
+                    before.version(), after.version(), request.items().size(), affectedKeys);
+            return after;
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    /** 各来源最近一次拉取健康状况（按优先级升序，供总览展示降级与最近可用情况）。 */
+    public List<SourceHealth> sourceHealth() {
+        List<SourceHealth> result = new ArrayList<>();
+        for (ConfigSource source : sources) {
+            SourceHealth h = healthBySource.get(source.name());
+            if (h != null) {
+                result.add(h);
+            }
+        }
+        return List.copyOf(result);
     }
 }

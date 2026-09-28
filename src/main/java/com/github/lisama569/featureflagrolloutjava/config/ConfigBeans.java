@@ -1,5 +1,6 @@
 package com.github.lisama569.featureflagrolloutjava.config;
 
+import com.github.lisama569.featureflagrolloutjava.ops.OperationsOverviewService;
 import com.github.lisama569.featureflagrolloutjava.rollout.FeatureFlagService;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -41,5 +42,10 @@ public class ConfigBeans {
     @Bean
     public FeatureFlagService featureFlagService(ConfigService configService) {
         return new FeatureFlagService(configService);
+    }
+
+    @Bean
+    public OperationsOverviewService operationsOverviewService(ConfigService configService) {
+        return new OperationsOverviewService(configService);
     }
 }

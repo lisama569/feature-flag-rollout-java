@@ -1,5 +1,7 @@
 package com.github.lisama569.featureflagrolloutjava.config;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.util.Map;
 
 /**
@@ -20,13 +22,17 @@ public final class ConfigSnapshot {
         this.createdAtMillis = createdAtMillis;
     }
 
+    @JsonProperty
     public long version() { return version; }
 
+    @JsonProperty
     public Map<String, String> entries() { return entries; }
 
     /** 各来源最近一次成功合并时的版本，用于审计与降级解释。 */
+    @JsonProperty
     public Map<String, Long> sourceVersions() { return sourceVersions; }
 
+    @JsonProperty
     public long createdAtMillis() { return createdAtMillis; }
 
     public String get(String key) { return entries.get(key); }
