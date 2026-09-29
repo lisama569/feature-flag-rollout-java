@@ -1,5 +1,7 @@
 package com.github.lisama569.featureflagrolloutjava.ops;
 
+import com.github.lisama569.featureflagrolloutjava.config.HistoryRetentionStatus;
+
 import java.util.List;
 
 /**
@@ -13,6 +15,7 @@ import java.util.List;
  * @param recentTruncated      是否因容量上限发生截断
  * @param recentTotalAvailable 截断前可用的近期动作总数
  * @param openFlags            当前打开的开关与灰度比例
+ * @param history              可回滚版本历史的保留与淘汰状况（含淘汰提示）
  * @param generatedAtMillis    总览生成时间
  */
 public record OperationsOverview(long currentVersion,
@@ -23,5 +26,6 @@ public record OperationsOverview(long currentVersion,
                                  boolean recentTruncated,
                                  int recentTotalAvailable,
                                  List<OpenFlagView> openFlags,
+                                 HistoryRetentionStatus history,
                                  long generatedAtMillis) {
 }

@@ -5,6 +5,9 @@ import com.github.lisama569.featureflagrolloutjava.config.ChangeRejectedExceptio
 import com.github.lisama569.featureflagrolloutjava.config.ChangeRequest;
 import com.github.lisama569.featureflagrolloutjava.config.ConfigService;
 import com.github.lisama569.featureflagrolloutjava.config.ConfigSnapshot;
+import com.github.lisama569.featureflagrolloutjava.config.HistoryRetentionStatus;
+import com.github.lisama569.featureflagrolloutjava.config.VersionEvictedException;
+import com.github.lisama569.featureflagrolloutjava.config.VersionNotFoundException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -52,9 +55,32 @@ public class ConfigController {
     }
 
     @PostMapping("/rollback/{version}")
-    public ConfigSnapshot rollback(@PathVariable long version,
-                                   @RequestParam(defaultValue = "api") String operator) {
-        return configService.rollback(version, operator);
+    public ResponseEntity<?> rollback(@PathVariable long version,
+                                      @RequestParam(defaultValue = "api") String operator) {
+        try {
+            return ResponseEntity.ok(configService.rollback(version, operator));
+        } catch (VersionEvictedException e) {
+            // 目标版本曾存在但已被保留上限淘汰：明确告知不可用与仍可回滚的最早版本，HTTP 410
+            return ResponseEntity.status(HttpStatus.GONE).body(Map.of(
+                    "reason", "VERSION_EVICTED",
+                    "version", e.version(),
+                    "retentionLimit", e.retentionLimit(),
+                    "oldestRetainedVersion", e.oldestRetainedVersion(),
+                    "message", e.getMessage()));
+        } catch (VersionNotFoundException e) {
+            // 目标版本从未存在：HTTP 404
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of(
+                    "reason", "VERSION_NOT_FOUND",
+                    "version", e.version(),
+                    "currentVersion", e.currentVersion(),
+                    "message", e.getMessage()));
+        }
+    }
+
+    /** 可回滚版本历史的保留状况：上限、当前保留版本、已淘汰计数与最近淘汰版本。 */
+    @GetMapping("/history")
+    public HistoryRetentionStatus history() {
+        return configService.historyRetentionStatus();
     }
 
     @GetMapping("/audit")

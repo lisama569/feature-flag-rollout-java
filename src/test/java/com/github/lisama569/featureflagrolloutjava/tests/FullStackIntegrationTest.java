@@ -82,7 +82,7 @@ class FullStackIntegrationTest {
         Map<String, Object> currentAfterPreview = rest.getForObject(uri("/api/config"), Map.class);
         assertEquals(base, ((Number) currentAfterPreview.get("version")).longValue());
 
-        // 4) 试算后再做一次过期试算：必须明确 STALE 而不是假装可发布
+        // 4) 试算后再做一次过期试算：必须明确 STALE 而不是假装可发布，且不回带预计值
         Map<String, Object> stalePreviewReq = Map.of(
                 "changeId", "e2e-preview-stale", "source", "curl", "baseVersion", base + 999,
                 "entries", Map.of("feature.new-checkout.percentage", "10"));
@@ -90,6 +90,28 @@ class FullStackIntegrationTest {
                 uri("/api/config/changes/preview"), jsonEntity(stalePreviewReq), Map.class);
         assertEquals(Boolean.FALSE, stalePreview.get("wouldApply"));
         assertEquals("STALE_BASE_VERSION", stalePreview.get("rejectionReason"));
+        assertNullish(stalePreview.get("proposedVersion"));
+        assertNullish(stalePreview.get("projectedEntries"));
+        assertEquals(0, ((List<?>) stalePreview.get("diffs")).size(),
+                "被拒绝的试算不得回带不会生效的预计差异");
+        assertEquals(0, ((List<?>) stalePreview.get("affectedFlags")).size());
+        // 被拒试算仍返回当前完整配置用于对照
+        assertNotNull(stalePreview.get("currentEntries"));
+
+        // 4b) 成功试算能拿到按当前版本合并后的完整预计配置
+        Map<String, Object> okPreviewReq = Map.of(
+                "changeId", "e2e-preview-full", "source", "curl", "baseVersion", base,
+                "entries", Map.of("feature.new-checkout.percentage", "77"));
+        Map<String, Object> okPreview = rest.postForObject(
+                uri("/api/config/changes/preview"), jsonEntity(okPreviewReq), Map.class);
+        assertEquals(Boolean.TRUE, okPreview.get("wouldApply"));
+        Map<String, String> projected = (Map<String, String>) okPreview.get("projectedEntries");
+        assertEquals("77", projected.get("feature.new-checkout.percentage"),
+                "完整预计配置含本次新值");
+        assertEquals("false", projected.get("feature.new-checkout.enabled"),
+                "完整预计配置也含未改动的当前键");
+        assertNotNull(okPreview.get("currentEntries"));
+        log.info("[http] preview full projection keys={}", projected.keySet());
 
         // 5) 批次原子发布（新链路）：整批一次生效
         Map<String, Object> batchReq = Map.of(
@@ -132,8 +154,30 @@ class FullStackIntegrationTest {
 
         // 7) 审计（既有全量 + 新的有界筛选）
         List<Map<String, Object>> auditAll = rest.getForObject(uri("/api/config/audit"), List.class);
-        assertTrue(auditAll.stream().anyMatch(r -> "e2e-batch-1".equals(r.get("changeId"))
-                && "APPLIED".equals(r.get("action"))));
+        Map<String, Object> batchAudit = auditAll.stream()
+                .filter(r -> "e2e-batch-1".equals(r.get("changeId"))
+                        && "APPLIED".equals(r.get("action")))
+                .findFirst().orElseThrow();
+        // 一条批次审计里完整保存整批键值、来源、操作者、前后版本
+        Map<String, String> batchEntriesInAudit = (Map<String, String>) batchAudit.get("entries");
+        log.info("[http] batch audit entries={}", batchEntriesInAudit);
+        assertEquals("80", batchEntriesInAudit.get("feature.new-checkout.percentage"));
+        assertEquals("true", batchEntriesInAudit.get("feature.checkout-v2.enabled"));
+        assertEquals("25", batchEntriesInAudit.get("feature.checkout-v2.percentage"));
+        assertEquals("release-pipeline", batchAudit.get("source"));
+        assertEquals("alice", batchAudit.get("operator"));
+        assertEquals(base, ((Number) batchAudit.get("fromVersion")).longValue());
+        assertEquals(base + 1, ((Number) batchAudit.get("toVersion")).longValue());
+
+        // 7b) 历史保留状况：默认上限保留，未淘汰
+        Map<String, Object> history = rest.getForObject(uri("/api/config/history"), Map.class);
+        log.info("[http] history -> limit={} retained={} evicted={}",
+                history.get("retentionLimit"), history.get("retainedVersions"),
+                history.get("evictedVersionCount"));
+        assertNotNull(history.get("retentionLimit"));
+        assertNotNull(history.get("retainedVersions"));
+        assertEquals(0, ((Number) history.get("evictedVersionCount")).intValue());
+
         Map<String, Object> appliedOnly = rest.getForObject(
                 uri("/api/ops/audit?action=APPLIED&limit=5"), Map.class);
         log.info("[http] ops audit APPLIED -> returned={} truncated={}",
@@ -167,6 +211,18 @@ class FullStackIntegrationTest {
         assertNotNull(overview.get("recentLimit"));
         assertNotNull(overview.get("recentTruncated"));
         assertNotNull(overview.get("generatedAtMillis"));
+        // 总览里带历史保留/淘汰状况
+        assertNotNull(overview.get("history"));
+        assertNotNull(((Map<?, ?>) overview.get("history")).get("retentionLimit"));
+        // 回滚到被淘汰/不存在版本的错误：回滚一个从未产生的版本号 -> 404 + VERSION_NOT_FOUND
+        ResponseEntity<Map> goneResp = rest.exchange(
+                uri("/api/config/rollback/999999?operator=oncall"),
+                org.springframework.http.HttpMethod.POST,
+                new org.springframework.http.HttpEntity<Void>(new org.springframework.http.HttpHeaders()), Map.class);
+        assertEquals(HttpStatus.NOT_FOUND, goneResp.getStatusCode());
+        assertEquals("VERSION_NOT_FOUND", goneResp.getBody().get("reason"));
+        log.info("[http] rollback never-existent -> {} {}",
+                goneResp.getStatusCode(), goneResp.getBody().get("message"));
         // 回滚后 new-checkout 总开关恢复为默认 false，总览中不应再列为打开
         List<Map<String, Object>> openFlags = (List<Map<String, Object>>) overview.get("openFlags");
         assertTrue(openFlags.stream().noneMatch(f -> "checkout-v2".equals(f.get("flag"))));

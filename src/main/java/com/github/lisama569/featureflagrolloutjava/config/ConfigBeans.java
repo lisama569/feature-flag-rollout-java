@@ -35,8 +35,10 @@ public class ConfigBeans {
     }
 
     @Bean
-    public ConfigService configService(List<ConfigSource> sources, AuditLog auditLog) {
-        return new ConfigService(sources, new ConfigValidator(), auditLog);
+    public ConfigService configService(List<ConfigSource> sources, AuditLog auditLog,
+                                       @org.springframework.beans.factory.annotation.Value(
+                                               "${feature-flag.history-retention-limit:500}") int historyRetentionLimit) {
+        return new ConfigService(sources, new ConfigValidator(), auditLog, historyRetentionLimit);
     }
 
     @Bean

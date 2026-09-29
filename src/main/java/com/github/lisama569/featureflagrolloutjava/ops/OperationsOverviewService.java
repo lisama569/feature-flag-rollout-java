@@ -3,6 +3,7 @@ package com.github.lisama569.featureflagrolloutjava.ops;
 import com.github.lisama569.featureflagrolloutjava.config.AuditRecord;
 import com.github.lisama569.featureflagrolloutjava.config.ConfigService;
 import com.github.lisama569.featureflagrolloutjava.config.ConfigSnapshot;
+import com.github.lisama569.featureflagrolloutjava.config.HistoryRetentionStatus;
 import com.github.lisama569.featureflagrolloutjava.config.SourceHealth;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -54,14 +55,16 @@ public class OperationsOverviewService {
         }
 
         List<OpenFlagView> openFlags = collectOpenFlags(snapshot);
+        HistoryRetentionStatus history = configService.historyRetentionStatus();
 
         OperationsOverview overview = new OperationsOverview(
                 snapshot.version(), anyDegraded, List.copyOf(sources), List.copyOf(recent),
                 RECENT_LIMIT, page.truncated(), page.totalMatched(),
-                List.copyOf(openFlags), System.currentTimeMillis());
-        log.info("[ops-overview] 输入: 值班总览请求 | 依据: 版本={} 来源数={} 降级={} 近期动作={}/{} 截断={} 打开开关={} | 结果: 总览已生成{}",
+                List.copyOf(openFlags), history, System.currentTimeMillis());
+        log.info("[ops-overview] 输入: 值班总览请求 | 依据: 版本={} 来源数={} 降级={} 近期动作={}/{} 截断={} 打开开关={} 历史保留={}/{} 已淘汰={} | 结果: 总览已生成{}",
                 snapshot.version(), sources.size(), anyDegraded, recent.size(),
                 page.totalMatched(), page.truncated(), openFlags.size(),
+                history.retainedCount(), history.retentionLimit(), history.evictedVersionCount(),
                 anyDegraded ? "（降级状态）" : "");
         return overview;
     }

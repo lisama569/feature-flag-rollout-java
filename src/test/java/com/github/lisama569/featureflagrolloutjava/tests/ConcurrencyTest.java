@@ -83,7 +83,7 @@ class ConcurrencyTest {
         for (Decision d : decisions) {
             ConfigSnapshot snap = configService.history().get(d.configVersion());
             if (snap == null) {
-                continue; // 历史被清理时跳过（当前实现保留全部历史，不会走到）
+                continue; // 历史已被有界保留上限淘汰时跳过（默认上限 500，本用例 200 次切换不会走到）
             }
             boolean masterOn = Boolean.parseBoolean(snap.get("feature.pay.enabled"));
             int pct = Integer.parseInt(snap.get("feature.pay.percentage"));

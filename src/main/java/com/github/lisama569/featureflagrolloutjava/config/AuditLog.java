@@ -6,6 +6,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
@@ -49,9 +50,21 @@ public class AuditLog {
     public AuditRecord append(String changeId, String source, String operator,
                               long fromVersion, long toVersion,
                               AuditRecord.Action action, String detail, List<String> affectedKeys) {
+        return append(changeId, source, operator, fromVersion, toVersion,
+                action, detail, affectedKeys, Map.of());
+    }
+
+    /**
+     * 追加一条审计记录，并携带动作完成后 affectedKeys 对应的完整键值
+     * （成功发布为发布值、回滚为恢复值；拒绝时传空 map）。
+     */
+    public AuditRecord append(String changeId, String source, String operator,
+                              long fromVersion, long toVersion,
+                              AuditRecord.Action action, String detail,
+                              List<String> affectedKeys, Map<String, String> entries) {
         AuditRecord record = new AuditRecord(seq.incrementAndGet(), changeId, source, operator,
                 fromVersion, toVersion, action, detail,
-                List.copyOf(affectedKeys), System.currentTimeMillis());
+                List.copyOf(affectedKeys), Map.copyOf(entries), System.currentTimeMillis());
         lock.lock();
         try {
             records.addLast(record);

@@ -62,11 +62,26 @@ enabled = masterSwitch && bucket < percentage
 
 所有应用与拒绝都会写入 `AuditLog`（来源、from/to 版本、动作、明细、时间戳）。
 
-### 回滚
+### 回滚与历史版本保留上限
 
 `rollback(toVersion, operator)` 把配置内容恢复为历史版本 `toVersion` 的内容，
-但**版本号继续递增**（回滚本身也是一次可审计的变更，记录 `ROLLED_BACK`）。
-目标版本不存在时抛出 `IllegalArgumentException`。
+但**版本号继续递增**（回滚本身也是一次可审计的变更，记录 `ROLLED_BACK`，且该审计记录
+同样携带恢复后的完整键值）。为避免服务长期运行后“每个版本各存一份完整配置、内存只增不减”，
+可回滚历史有明确保留上限：
+
+- 默认只保留最近 **500** 个版本（`ConfigService.DEFAULT_HISTORY_LIMIT`，含当前版本），
+  可用构造参数或配置项 `feature-flag.history-retention-limit` 调整；
+- 超出上限时按 **FIFO 淘汰最老版本**：其快照内容被删除、累计 `evictedVersionCount`，
+  并保留最近 20 个被淘汰版本号（`recentlyEvictedVersions`）仅用于提示；
+- 保留状况可通过 `GET /api/config/history` 查询，值班总览 `GET /api/ops/overview`
+  也带 `history` 字段（上限、当前保留版本、最早可回滚版本、淘汰计数、最近淘汰版本号）；
+- 回滚目标的三种结局**明确可区分，绝不静默恢复成别的内容**：
+
+| 目标版本 | 行为 | REST 结果 |
+|----------|------|-----------|
+| 在保留窗口内 | 恢复该版本内容，版本号 +1，记 `ROLLED_BACK` | 200 |
+| 曾存在但**已被淘汰** | 抛 `VersionEvictedException`，消息含上限与“当前可回滚最早版本” | **410** `VERSION_EVICTED`（含 `oldestRetainedVersion`、`retentionLimit`） |
+| 从未存在过 | 抛 `VersionNotFoundException` | **404** `VERSION_NOT_FOUND`（含 `currentVersion`） |
 
 ### 来源异常降级
 
@@ -88,10 +103,20 @@ enabled = masterSwitch && bucket < percentage
 - `wouldApply`：若正式提交是否会被接受；`proposedVersion`：预计发布后的版本号；
 - `rejectionReason` + `message`：被拒绝时的**可区分原因**与面向人的明确说明
   （`STALE_BASE_VERSION` / `DUPLICATE_CHANGE_ID` / `INVALID_ENTRIES`）；
-- `errors`：每个非法配置项及其 `ViolationCode`；
-- `diffs`：逐项 `currentValue` vs `proposedValue`，变化类型
-  `ADDED` / `UPDATED` / `UNCHANGED`；
-- `affectedFlags`：受影响开关的总开关与灰度比例前后值及变化类型。
+- `errors`：每个非法配置项及其 `ViolationCode`（仅 `INVALID_ENTRIES` 时非空，
+  这是“说明原因”的一部分，不是预计值）；
+- **成功（`wouldApply=true`）时能拿到的完整预计结果：**
+  - `projectedEntries`：按当前生效版本**合并本次提交后的完整预计配置**
+    （未涉及的键也按当前值带入，可直接确认发布后整套配置长什么样）；
+  - `currentEntries`：当前生效的完整配置（成功/被拒都返回），与 `projectedEntries` 逐键对照；
+  - `diffs`：本次涉及键的逐项 `currentValue` vs `proposedValue`，变化类型
+    `ADDED` / `UPDATED` / `UNCHANGED`；
+  - `affectedFlags`：受影响开关的总开关与灰度比例前后值及变化类型。
+- **被拒绝（`wouldApply=false`）时只说明原因，不回带注定不生效的值：**
+  - `proposedVersion=null`、`projectedEntries=null`；
+  - `diffs` 与 `affectedFlags` 固定为空列表——新开关值/新比例不会被当作“预计值/受影响项”
+    返回，避免看起来像要生效；
+  - 仍然返回 `currentEntries`（当前真实配置）与明确的 `rejectionReason/message`，非法时附 `errors`。
 
 **试算与正式发布的边界（强保证）：**
 
@@ -99,8 +124,8 @@ enabled = masterSwitch && bucket < percentage
 2. 试算**不写审计**、**不占用真实发布的幂等位置**：同一个 `changeId` 可以反复试算，
    试算之后仍可用于真实发布；只有真实发布（单条或批次）才会登记幂等标识；
 3. 基准版本已过期、内容不合法、或该标识此前已真实发布过时，试算返回
-   `wouldApply=false`、`proposedVersion=null` 并给出对应原因，**不会让人误以为已生效**。
-   判定顺序与正式提交一致：重复标识优先于过期基准。
+   `wouldApply=false`、`proposedVersion=null`、`projectedEntries=null` 且不回带差异，
+   **不会让人误以为已生效**。判定顺序与正式提交一致：重复标识优先于过期基准。
 4. 试算接口永远返回 HTTP 200（因为它本身是成功的“查询”），预计结果是否可接受请看
    `wouldApply`；正式提交被拒绝才返回 409。
 
@@ -130,10 +155,14 @@ enabled = masterSwitch && bucket < percentage
   （生效配置仍通过 `AtomicReference` 整体切换，所有写操作由同一把写锁串行化）。
   并发的试算、发布、回滚、灰度判定混在一起也保持该语义；
 - 一次成功的批次发布**只形成一个可回滚版本**；
-- 审计中一条 `APPLIED` 记录即代表整批：含整批键 `affectedKeys`、来源 `source`、
-  操作者 `operator`、前后版本；
+- 审计中一条 `APPLIED` 记录即代表整批：除了整批键 `affectedKeys`、来源 `source`、
+  操作者 `operator`、前后版本外，`entries` 字段**完整保存整批每个键的最终发布值**
+  （事后复盘/追责可直接读到每个键最终发成了什么，不必再猜）；回滚产生的
+  `ROLLED_BACK` 记录同样在 `entries` 中携带恢复后的完整键值；被拒绝的批次
+  `entries` 为空 map（不会把未发布内容记成已发布）；
 - `rollback` 到批次前/批次所在版本时，恢复的都是**整批内容**，不会只回一部分
-  （回滚版本号继续递增，记 `ROLLED_BACK`，操作者入审计）。
+  （回滚版本号继续递增，记 `ROLLED_BACK`，操作者与恢复后的完整键值入审计）。
+  若目标批次版本已超过历史保留上限被淘汰，则明确返回 410 `VERSION_EVICTED`（见 §3）。
 
 **幂等 / 过期规则：**
 
@@ -147,9 +176,11 @@ enabled = masterSwitch && bucket < percentage
 ## 6. 值班运行总览与诊断
 
 - `GET /api/ops/overview`：当前生效版本、各来源是否降级与最近一次可用情况、
-  最近的发布成功/拒绝/回滚摘要、当前打开（总开关为 true）的开关及其灰度比例；
-  含 `generatedAtMillis`。
+  最近的发布成功/拒绝/回滚摘要、当前打开（总开关为 true）的开关及其灰度比例，
+  以及**可回滚历史的保留/淘汰状况**（`history` 字段）；含 `generatedAtMillis`。
 - `GET /api/ops/audit?action=APPLIED&from=<毫秒>&to=<毫秒>&limit=50`：有界、可筛选审计。
+- `GET /api/config/history`：历史保留上限、当前保留版本号、最早可回滚版本、
+  已淘汰版本计数与最近淘汰版本号（回滚前先确认目标版本是否还在窗口内）。
 
 **容量上限、截断与降级提示：**
 
@@ -170,10 +201,14 @@ enabled = masterSwitch && bucket < percentage
 - 既有接口与语义全部保留：`GET /api/config`、`POST /api/config/refresh`、
   `POST /api/config/changes`、`POST /api/config/rollback/{version}`、
   `GET /api/config/audit`、`GET /api/flags/evaluate` 的路径、请求/判定语义不变；
-- `AuditRecord` 新增了 `operator`、`affectedKeys` 字段：旧构造路径下
-  `operator` 取 `source`、`affectedKeys` 为空列表，老代码无需改动；
+- `AuditRecord` 新增了 `operator`、`affectedKeys`、`entries` 字段：旧构造路径下
+  `operator` 取 `source`、`affectedKeys` 与 `entries` 为空，老代码无需改动；
 - `GET /api/config/audit` 仍返回当前保留的全部审计记录（正序）；
   新的有界/筛选能力通过新的 `/api/ops/audit` 提供；
+- 回滚到不可用版本时，过去只抛笼统的 `IllegalArgumentException`，现在细分为
+  `VersionEvictedException`（已淘汰，HTTP 410）与 `VersionNotFoundException`
+  （从未存在，HTTP 404）；二者仍继承 `IllegalArgumentException`，
+  且历史默认保留上限 500 足够大，既有“回滚近期版本”的调用行为不变；
 - `RejectionReason` 为新增枚举值 `EMPTY_BATCH`（仅批次空时出现），原有三个原因与
   409 行为不变；
 - 顺带修复了 `ConfigSnapshot` 经 HTTP 序列化的问题（此前手写类的 `version()` 等访问器
@@ -189,7 +224,8 @@ enabled = masterSwitch && bucket < percentage
 | GET | `/api/config` | 当前生效快照 |
 | POST | `/api/config/refresh` | 触发全量热更新 |
 | POST | `/api/config/changes` | 提交单条变更（拒绝时 409 + 可区分原因） |
-| POST | `/api/config/rollback/{version}?operator=xx` | 回滚到指定版本 |
+| POST | `/api/config/rollback/{version}?operator=xx` | 回滚到指定版本（已淘汰 410 / 从未存在 404） |
+| GET | `/api/config/history` | 历史保留上限、保留中版本、淘汰计数与最近淘汰版本 |
 | GET | `/api/config/audit` | 当前保留的全部审计记录（正序） |
 | GET | `/api/flags/evaluate?flag=pay&subject=u1` | 开关判定（返回可解释 Decision） |
 
@@ -211,13 +247,23 @@ mvn test
 # 启动服务
 mvn spring-boot:run
 
-# 1) 发布前试算：基于当前版本给出预计结果/差异/受影响开关，但当前配置不变
+# 1) 发布前试算（成功）：拿到合并后的【完整预计配置】projectedEntries，
+#    以及 currentEntries/diffs/affectedFlags 与当前值逐项对照；当前配置不变
 curl -s -X POST localhost:8080/api/config/changes/preview \
   -H 'Content-Type: application/json' -d '{
     "changeId": "demo-pre", "source": "curl", "baseVersion": 1,
     "entries": {"feature.new-checkout.enabled": "true", "feature.new-checkout.percentage": "50"}}'
-# 关注 wouldApply=true、proposedVersion=2、diffs/affectedFlags；
+# 关注 wouldApply=true、proposedVersion=2、projectedEntries（含未改动键的整套配置）；
 # 再 GET /api/config 会发现版本仍是 1（试算未生效、未占幂等）。
+
+# 1b) 发布前试算（被拒：基准过期 / 标识已发布过 / 内容非法）：
+#     wouldApply=false、proposedVersion=null、projectedEntries=null、
+#     diffs/affectedFlags 为空——不回带任何注定不生效的“预计值”，只给原因
+curl -s -X POST localhost:8080/api/config/changes/preview \
+  -H 'Content-Type: application/json' -d '{
+    "changeId": "demo-pre-stale", "source": "curl", "baseVersion": 999,
+    "entries": {"feature.new-checkout.percentage": "50"}}'
+# 期望 rejectionReason=STALE_BASE_VERSION、diffs=[]、affectedFlags=[]、currentEntries 仍返回
 
 # 2) 批次原子发布：两个开关一起发布，只产生一个版本
 curl -s -X POST localhost:8080/api/config/batch \
@@ -229,17 +275,32 @@ curl -s -X POST localhost:8080/api/config/batch \
       {"flag": "checkout-v2",   "entries": {"feature.checkout-v2.enabled": "true", "feature.checkout-v2.percentage": "25"}}]}'
 # 重复提交同一 batchId（即使 baseVersion 更新）-> 409 DUPLICATE_CHANGE_ID
 
+# 2b) 一条批次审计里读到整批完整键值/来源/操作者/前后版本
+curl -s localhost:8080/api/config/audit
+# 在 APPLIED 记录中看 entries（feature.new-checkout.percentage=80、checkout-v2.* 等全在）
+
 # 3) 灰度判定（输入、依据、结果）
 curl -s 'localhost:8080/api/flags/evaluate?flag=checkout-v2&subject=user-42'
 
-# 4) 值班总览（来源状态/降级、近期成功拒绝回滚、打开开关与比例、截断提示）
+# 4) 值班总览（来源状态/降级、近期成功拒绝回滚、打开开关与比例、截断提示、历史保留/淘汰）
 curl -s localhost:8080/api/ops/audit?action=APPLIED\&limit=5     # 只看成功发布
 curl -s 'localhost:8080/api/ops/audit?from=1700000000000&limit=50'
-curl -s localhost:8080/api/ops/overview
+curl -s localhost:8080/api/ops/overview                          # 内含 history 保留/淘汰提示
+curl -s localhost:8080/api/config/history                        # 专门查历史保留窗口
 
 # 5) 回滚到批次前版本 1：整批内容一起恢复（checkout-v2 也会消失）
 curl -s -X POST 'localhost:8080/api/config/rollback/1?operator=oncall'
+# 若目标版本已被保留上限淘汰 -> HTTP 410 VERSION_EVICTED（消息含可回滚最早版本）；
+# 若该版本号从未产生过        -> HTTP 404 VERSION_NOT_FOUND。
 ```
+
+> 想在本地快速复现“历史淘汰 + 410”，可用很小的保留上限启动：
+>
+> ```bash
+> mvn spring-boot:run -Dspring-boot.run.arguments=--feature-flag.history-retention-limit=3
+> # 连续发布 4 次后，最早的版本被淘汰；curl /api/config/history 可见 evictedVersionCount，
+> # 再 POST /api/config/rollback/1 会得到 410 VERSION_EVICTED。
+> ```
 
 测试覆盖（`src/test/java/.../tests/`）：
 
@@ -249,16 +310,28 @@ curl -s -X POST 'localhost:8080/api/config/rollback/1?operator=oncall'
   可解释判定、放量提升只迁移边界主体；
 - `ConcurrencyTest`：8 读线程 × 2000 次判定叠加 200 次配置切换，逐条对照版本快照重算，
   验证无新旧混用；16 线程并发提交同一 changeId 仅生效一次；并发 refresh 与读取快照自洽；
-- `PreviewServiceTest`（新）：试算预计结果/差异/受影响开关、不改变生效配置与历史、
+- `PreviewServiceTest`：试算预计结果/差异/受影响开关、不改变生效配置与历史、
   不占幂等位置、过期/重复/非法原因可区分；
-- `BatchPublishTest`（新）：批次整批生效且只产生一个版本、整批审计含来源/操作者/整批键、
+- `PreviewRejectionContractTest`（本次新增）：成功试算返回合并后的完整预计配置并与当前值对照；
+  过期/重复/非法三类被拒试算**不回带** `projectedEntries/diffs/affectedFlags`（只留原因与
+  `errors`）；被拒试算不改生效配置、历史、审计，也不占真实发布幂等占位；
+- `BatchPublishTest`：批次整批生效且只产生一个版本、整批审计含来源/操作者/整批键、
   一项非法/基准过期/重复/空批次整批拒绝且不部分生效、回滚恢复整批内容；
-- `BatchConcurrencyTest`（新）：16 线程并发同一 batchId 仅生效一次；批次发布/回滚/试算/
+- `BatchAuditEntriesTest`（本次新增）：一条批次审计可读到整批每个键的**最终发布值**、
+  来源/操作者/前后版本；回滚审计携带整批恢复值；被拒绝批次审计 `entries` 为空；
+- `HistoryRetentionTest`（本次新增）：历史超过保留上限后按 FIFO 淘汰、内存有界、
+  状态/总览给出淘汰提示；回滚已淘汰版本明确抛 `VersionEvictedException`（不静默恢复），
+  从未存在版本抛可区分的 `VersionNotFoundException`，窗口内版本仍可回滚；
+- `BatchConcurrencyTest`：16 线程并发同一 batchId 仅生效一次；批次发布/回滚/试算/
   灰度判定并发时读取方只见完整旧结果或完整新结果，试算不污染状态；
-- `OperationsOverviewTest`（新）：来源降级时总览仍可用且明确标注、打开开关与比例正确、
+- `PublishRollbackVisibilityTest`（本次新增）：80 次整批发布 vs 80 次整批回滚并发，
+  8 读线程在锁外逐键比对整份快照，任何时刻都只见完整旧结果或完整新结果，最终状态亦完整；
+- `OperationsOverviewTest`：来源降级时总览仍可用且明确标注、打开开关与比例正确、
   近期摘要上限与截断提示、审计按结果/时间筛选、有界容量与淘汰计数；
-- `FullStackIntegrationTest`（新）：**真正启动 Spring Boot 服务（随机端口）**，从外部 HTTP
-  依次打通灰度判定、热更新、审计、回滚以及新增的试算、批次、总览/审计查询，返回 JSON
-  均可直接读取解析。
+- `FullStackIntegrationTest`：**真正启动 Spring Boot 服务（随机端口）**，从外部 HTTP
+  依次打通灰度判定、热更新、审计（含整批键值）、回滚（含 404）以及试算完整预计/被拒不回带、
+  批次、总览/历史/审计查询，返回 JSON 均可直接读取解析；
+- `RollbackEvictionHttpTest`（本次新增）：以保留上限 3 真实启动服务，HTTP 复现旧版本淘汰、
+  `/api/config/history` 淘汰提示、回滚已淘汰版本返回 410 `VERSION_EVICTED` 且窗口内版本可回滚。
 
 所有新增与既有链路的日志均继续打印输入、判定依据与最终生效结果。
