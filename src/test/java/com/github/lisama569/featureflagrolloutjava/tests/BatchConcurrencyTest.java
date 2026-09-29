@@ -38,7 +38,10 @@ class BatchConcurrencyTest {
                 "feature.a.enabled", "false", "feature.a.percentage", "0",
                 "feature.b.enabled", "false", "feature.b.percentage", "0"));
         InMemoryConfigSource dynamic = new InMemoryConfigSource("dynamic", 100);
-        return new ConfigService(List.of(defaults, dynamic), new ConfigValidator(), new AuditLog());
+        // 并发用例会制造数百个版本并反复回滚到初始版本，显式给出足够大的历史保留上限，
+        // 避免默认上限淘汰初始版本而干扰并发语义校验（淘汰行为由专门的历史保留用例覆盖）
+        return new ConfigService(List.of(defaults, dynamic), new ConfigValidator(),
+                new AuditLog(), 10_000);
     }
 
     private BatchPublishRequest batch(String id, long base) {

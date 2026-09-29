@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -23,19 +24,30 @@ import java.util.concurrent.locks.ReentrantLock;
  *   <li>生效快照通过 {@link AtomicReference} 整体原子切换，读取方不会观察到半新半旧状态；</li>
  *   <li>写操作（refresh/submitChange/rollback）由同一把写锁串行化；</li>
  *   <li>非法配置项被拒绝并保留已生效取值，不会静默覆盖；</li>
- *   <li>来源不可用时降级到该来源最近一次可用快照，而不是直接失败。</li>
+ *   <li>来源不可用时降级到该来源最近一次可用快照，而不是直接失败；</li>
+ *   <li>可回滚历史有明确保留上限（{@link #DEFAULT_HISTORY_RETENTION}，可在构造时调整），
+ *       超出上限的旧版本按版本从老到新淘汰并计数，内存不会随运行时间无限增长；
+ *       回滚到已淘汰版本会抛出 {@link VersionEvictedException} 明确告知，绝不静默恢复成别的内容。</li>
  * </ul>
  */
 public class ConfigService {
     private static final Logger log = LoggerFactory.getLogger(ConfigService.class);
 
+    /** 默认可回滚历史保留上限（版本数）。 */
+    public static final int DEFAULT_HISTORY_RETENTION = 20;
+
     /** 按优先级升序排列，合并时高优先级后写覆盖低优先级。 */
     private final List<ConfigSource> sources;
     private final ConfigValidator validator;
     private final AuditLog auditLog;
+    private final int historyRetention;
 
     private final AtomicReference<ConfigSnapshot> current;
     private final Map<Long, ConfigSnapshot> history = new ConcurrentHashMap<>();
+    /** 因保留上限被淘汰的历史版本数（只增不减，供总览展示淘汰提示）。 */
+    private final AtomicLong historyEvictedCount = new AtomicLong(0);
+    /** 已被淘汰的最大版本号（版本号连续递增，小于等于它的历史版本均已被淘汰）；-1 表示尚未发生淘汰。 */
+    private final AtomicLong maxEvictedVersion = new AtomicLong(-1);
     /** 各来源最近一次成功加载的原始配置，用于来源不可用时降级。 */
     private final Map<String, Map<String, String>> lastGoodBySource = new ConcurrentHashMap<>();
     /** 各来源最近一次成功加载对应的快照版本，用于审计解释。 */
@@ -47,11 +59,20 @@ public class ConfigService {
     private final ReentrantLock writeLock = new ReentrantLock();
 
     public ConfigService(List<ConfigSource> sources, ConfigValidator validator, AuditLog auditLog) {
+        this(sources, validator, auditLog, DEFAULT_HISTORY_RETENTION);
+    }
+
+    public ConfigService(List<ConfigSource> sources, ConfigValidator validator, AuditLog auditLog,
+                         int historyRetention) {
+        if (historyRetention < 1) {
+            throw new IllegalArgumentException("历史保留上限必须为正: " + historyRetention);
+        }
         this.sources = sources.stream()
                 .sorted(Comparator.comparingInt(ConfigSource::priority))
                 .toList();
         this.validator = validator;
         this.auditLog = auditLog;
+        this.historyRetention = historyRetention;
         for (ConfigSource source : this.sources) {
             healthBySource.put(source.name(), new SourceHealth(
                     source.name(), source.priority(), false, null, null, null, 0));
@@ -120,7 +141,7 @@ public class ConfigService {
             ConfigSnapshot after = new ConfigSnapshot(before.version() + 1, merged,
                     new HashMap<>(sourceVersions), System.currentTimeMillis());
             current.set(after);
-            history.put(after.version(), after);
+            recordHistory(after);
             log.info("[config-refresh] 版本 {} -> {}，生效项={}，降级来源={}，拒绝非法项={}",
                     before.version(), after.version(), merged.size(), degraded, rejected.size());
             return after;
@@ -163,10 +184,12 @@ public class ConfigService {
             ConfigSnapshot after = new ConfigSnapshot(before.version() + 1, merged,
                     new HashMap<>(sourceVersions), System.currentTimeMillis());
             current.set(after);
-            history.put(after.version(), after);
+            recordHistory(after);
             appliedChangeIds.add(request.changeId());
-            auditLog.append(request.changeId(), request.source(), before.version(), after.version(),
-                    AuditRecord.Action.APPLIED, "keys=" + request.entries().keySet());
+            auditLog.append(request.changeId(), request.source(), request.source(),
+                    before.version(), after.version(), AuditRecord.Action.APPLIED,
+                    "keys=" + request.entries().keySet(),
+                    List.copyOf(request.entries().keySet()), Map.copyOf(request.entries()));
             log.info("[config-change] changeId={} 来源={} 版本 {} -> {}，变更键={}",
                     request.changeId(), request.source(), before.version(), after.version(),
                     request.entries().keySet());
@@ -176,19 +199,30 @@ public class ConfigService {
         }
     }
 
-    /** 回滚到指定历史版本；目标版本不存在时抛出 {@link IllegalArgumentException}。 */
+    /**
+     * 回滚到指定历史版本。
+     * 目标版本已被保留上限淘汰时抛出 {@link VersionEvictedException}（明确告知已不可用、
+     * 给出当前可回滚的最早版本）；目标版本从未存在时抛出 {@link IllegalArgumentException}。
+     * 两种情况都不会改动当前生效配置。
+     */
     public ConfigSnapshot rollback(long toVersion, String operator) {
         writeLock.lock();
         try {
             ConfigSnapshot before = current.get();
             ConfigSnapshot target = history.get(toVersion);
             if (target == null) {
+                if (toVersion >= 0 && toVersion <= maxEvictedVersion.get()) {
+                    log.warn("[config-rollback] 操作人={} 目标版本={} 已被淘汰（保留上限={} 最早可回滚={}），拒绝回滚",
+                            operator, toVersion, historyRetention, earliestRetainedVersion());
+                    throw new VersionEvictedException(toVersion, earliestRetainedVersion(),
+                            historyRetention);
+                }
                 throw new IllegalArgumentException("回滚目标版本不存在: " + toVersion);
             }
             ConfigSnapshot after = new ConfigSnapshot(before.version() + 1, target.entries(),
                     target.sourceVersions(), System.currentTimeMillis());
             current.set(after);
-            history.put(after.version(), after);
+            recordHistory(after);
             auditLog.append("rollback-to-" + toVersion, operator, before.version(), after.version(),
                     AuditRecord.Action.ROLLED_BACK, "回滚到版本 " + toVersion);
             log.info("[config-rollback] 操作人={} 版本 {} -> {}（内容取自版本 {}）",
@@ -196,6 +230,26 @@ public class ConfigService {
             return after;
         } finally {
             writeLock.unlock();
+        }
+    }
+
+    /**
+     * 记录一个可回滚版本，并按保留上限淘汰最老版本（版本号最小者）。
+     * 只在写锁内调用；当前版本号最大，永远不会被淘汰。
+     */
+    private void recordHistory(ConfigSnapshot snapshot) {
+        history.put(snapshot.version(), snapshot);
+        while (history.size() > historyRetention) {
+            long oldest = history.keySet().stream().mapToLong(Long::longValue).min().orElseThrow();
+            if (oldest >= snapshot.version()) {
+                break; // 防御：绝不淘汰刚写入的当前版本
+            }
+            if (history.remove(oldest) != null) {
+                historyEvictedCount.incrementAndGet();
+                maxEvictedVersion.set(oldest);
+                log.info("[config-history] 历史超过保留上限 {}，淘汰最老版本 {}（累计淘汰 {}）",
+                        historyRetention, oldest, historyEvictedCount.get());
+            }
         }
     }
 
@@ -211,6 +265,21 @@ public class ConfigService {
         return Map.copyOf(history);
     }
 
+    /** 可回滚历史的保留上限（版本数）。 */
+    public int historyRetention() {
+        return historyRetention;
+    }
+
+    /** 因保留上限被淘汰的历史版本总数（只增不减）。 */
+    public long historyEvictedCount() {
+        return historyEvictedCount.get();
+    }
+
+    /** 当前仍保留、可回滚的最早版本号。 */
+    public long earliestRetainedVersion() {
+        return history.keySet().stream().mapToLong(Long::longValue).min().orElse(0);
+    }
+
     public AuditLog auditLog() {
         return auditLog;
     }
@@ -223,7 +292,10 @@ public class ConfigService {
      *   <li>只读当前快照，绝不修改生效配置、可回滚历史；</li>
      *   <li>不写入 {@code appliedChangeIds}，不占用真实发布的幂等位置，也不写审计；</li>
      *   <li>基准版本过期 / 内容非法 / 标识已真实发布过，分别返回可区分的拒绝原因，
-     *       {@code wouldApply=false}，{@code proposedVersion=null}，调用方不能误以为已生效。</li>
+     *       {@code wouldApply=false}，{@code proposedVersion=null}，调用方不能误以为已生效；</li>
+     *   <li>被拒绝的试算<strong>不回带任何“预计会生效”的值</strong>：diffs、affectedFlags
+     *       为空列表，mergedEntries 为 null——注定不会生效的新开关值与新比例不会出现在
+     *       预计结果里，避免发布前演练误判。</li>
      * </ul>
      * 拒绝原因判定顺序与 {@link #submitChange} 保持一致：重复标识优先于过期基准。
      */
@@ -231,8 +303,6 @@ public class ConfigService {
         writeLock.lock();
         try {
             ConfigSnapshot before = current.get();
-            List<EntryDiff> diffs = buildDiffs(before.entries(), request.entries());
-            List<FlagImpact> impacts = buildFlagImpacts(before.entries(), request.entries());
 
             RejectionReason reason = null;
             String message;
@@ -250,7 +320,7 @@ public class ConfigService {
                 errors = validator.validate(request.entries());
                 if (!errors.isEmpty()) {
                     reason = RejectionReason.INVALID_ENTRIES;
-                    message = "试算结果: 含 " + errors.size() + " 个非法配置项，正式提交会被整批拒绝；以下差异仅为对照，不会生效。";
+                    message = "试算结果: 含 " + errors.size() + " 个非法配置项，正式提交会被整批拒绝，当前配置不会变化。";
                 } else {
                     message = "试算结果: 校验通过，正式提交预计从版本 " + before.version()
                             + " 升到 " + (before.version() + 1) + "，当前配置未被修改。";
@@ -258,14 +328,26 @@ public class ConfigService {
             }
 
             boolean wouldApply = reason == null;
+            // 只有预计会生效时才计算预计值；被拒绝时一律为空，不回带不会生效的新值
             Long proposedVersion = wouldApply ? before.version() + 1 : null;
+            List<EntryDiff> diffs = wouldApply
+                    ? buildDiffs(before.entries(), request.entries()) : List.of();
+            List<FlagImpact> impacts = wouldApply
+                    ? buildFlagImpacts(before.entries(), request.entries()) : List.of();
+            Map<String, String> mergedEntries = null;
+            if (wouldApply) {
+                Map<String, String> merged = new LinkedHashMap<>(before.entries());
+                merged.putAll(request.entries());
+                mergedEntries = Map.copyOf(merged);
+            }
             PreviewResult result = new PreviewResult(wouldApply, reason, message,
                     request.baseVersion(), before.version(), proposedVersion,
-                    errors, List.copyOf(diffs), List.copyOf(impacts));
-            log.info("[config-preview] changeId={} | 依据: 当前版本={} baseVersion={} 拒绝原因={} 非法项={} 受影响开关={} | 结果: wouldApply={} 预计版本={}",
+                    errors, diffs, impacts, mergedEntries);
+            log.info("[config-preview] changeId={} | 依据: 当前版本={} baseVersion={} 拒绝原因={} 非法项={} 受影响开关={} | 结果: wouldApply={} 预计版本={} 合并项数={}",
                     request.changeId(), before.version(), request.baseVersion(), reason,
                     errors.size(), impacts.stream().map(FlagImpact::flag).toList(),
-                    wouldApply, proposedVersion);
+                    wouldApply, proposedVersion,
+                    mergedEntries == null ? 0 : mergedEntries.size());
             return result;
         } finally {
             writeLock.unlock();
@@ -424,13 +506,13 @@ public class ConfigService {
             ConfigSnapshot after = new ConfigSnapshot(before.version() + 1, merged,
                     new HashMap<>(sourceVersions), System.currentTimeMillis());
             current.set(after);
-            history.put(after.version(), after);
+            recordHistory(after);
             appliedChangeIds.add(request.batchId());
             List<String> affectedKeys = List.copyOf(batchEntries.keySet());
             auditLog.append(request.batchId(), request.source(), request.operator(),
                     before.version(), after.version(), AuditRecord.Action.APPLIED,
                     "BATCH items=" + request.items().size() + " keys=" + affectedKeys,
-                    affectedKeys);
+                    affectedKeys, Map.copyOf(batchEntries));
             log.info("[config-batch] batchId={} 来源={} 操作者={} 版本 {} -> {}，项数={} 整批键={}",
                     request.batchId(), request.source(), request.operator(),
                     before.version(), after.version(), request.items().size(), affectedKeys);

@@ -16,6 +16,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -78,6 +79,43 @@ class BatchPublishTest {
         assertTrue(applied.affectedKeys().contains("feature.a.percentage"));
         assertTrue(applied.affectedKeys().contains("feature.b.percentage"));
         assertEquals(4, applied.affectedKeys().size());
+        // 一条批次记录即可完整复盘：每个键最终发布成了什么值
+        assertEquals(Map.of(
+                "feature.a.enabled", "true", "feature.a.percentage", "30",
+                "feature.b.enabled", "true", "feature.b.percentage", "70"),
+                applied.affectedEntries());
+    }
+
+    @Test
+    void batchAuditRecord_carriesFullKeyValuesSourceOperatorAndVersions() throws Exception {
+        long base = service.currentSnapshot().version();
+        service.publishBatch(new BatchPublishRequest("batch-audit", "release-pipeline", "dave",
+                base, List.of(
+                item("a", Map.of("feature.a.enabled", "true", "feature.a.percentage", "45")),
+                item("b", Map.of("feature.b.percentage", "5")))));
+
+        AuditRecord record = auditLog.records().stream()
+                .filter(r -> r.changeId().equals("batch-audit")
+                        && r.action() == AuditRecord.Action.APPLIED)
+                .findFirst().orElseThrow();
+        log.info("[test] 输入: 三键批次 | 依据: 一条 APPLIED 记录承载整批 | 结果: keys={} entries={} {}->{} by {}/{}",
+                record.affectedKeys(), record.affectedEntries(),
+                record.fromVersion(), record.toVersion(), record.source(), record.operator());
+        // 整批的键和值一一对应、与生效配置一致
+        assertEquals(3, record.affectedEntries().size());
+        assertEquals("true", record.affectedEntries().get("feature.a.enabled"));
+        assertEquals("45", record.affectedEntries().get("feature.a.percentage"));
+        assertEquals("5", record.affectedEntries().get("feature.b.percentage"));
+        assertEquals(record.affectedEntries().keySet(), Set.copyOf(record.affectedKeys()));
+        for (Map.Entry<String, String> e : record.affectedEntries().entrySet()) {
+            assertEquals(e.getValue(), service.get(e.getKey()),
+                    "审计记录的值必须与实际生效值一致: " + e.getKey());
+        }
+        // 来源、操作者、前后版本
+        assertEquals("release-pipeline", record.source());
+        assertEquals("dave", record.operator());
+        assertEquals(base, record.fromVersion());
+        assertEquals(base + 1, record.toVersion());
     }
 
     @Test

@@ -37,7 +37,10 @@ class ConcurrencyTest {
         source.setEntries(Map.of(
                 "feature.pay.enabled", "true",
                 "feature.pay.percentage", "0"));
-        ConfigService configService = new ConfigService(List.of(source), new ConfigValidator(), new AuditLog());
+        // 本测试要逐条对照历史版本快照重算判定结果，显式给出足够大的历史保留上限，
+        // 避免默认上限在 200 次切换后淘汰旧版本而干扰一致性校验
+        ConfigService configService = new ConfigService(List.of(source), new ConfigValidator(),
+                new AuditLog(), 10_000);
         FeatureFlagService flags = new FeatureFlagService(configService);
 
         int readerCount = 8;
@@ -83,7 +86,7 @@ class ConcurrencyTest {
         for (Decision d : decisions) {
             ConfigSnapshot snap = configService.history().get(d.configVersion());
             if (snap == null) {
-                continue; // 历史被清理时跳过（当前实现保留全部历史，不会走到）
+                continue; // 历史超过保留上限被淘汰时跳过（本测试显式给了足够大的上限，不会走到）
             }
             boolean masterOn = Boolean.parseBoolean(snap.get("feature.pay.enabled"));
             int pct = Integer.parseInt(snap.get("feature.pay.percentage"));

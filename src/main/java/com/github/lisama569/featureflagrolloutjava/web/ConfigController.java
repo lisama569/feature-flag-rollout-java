@@ -5,6 +5,7 @@ import com.github.lisama569.featureflagrolloutjava.config.ChangeRejectedExceptio
 import com.github.lisama569.featureflagrolloutjava.config.ChangeRequest;
 import com.github.lisama569.featureflagrolloutjava.config.ConfigService;
 import com.github.lisama569.featureflagrolloutjava.config.ConfigSnapshot;
+import com.github.lisama569.featureflagrolloutjava.config.VersionEvictedException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -51,10 +52,27 @@ public class ConfigController {
         }
     }
 
+    /**
+     * 回滚到指定版本。
+     * 版本已被保留上限淘汰：410 + VERSION_EVICTED（附可回滚的最早版本）；
+     * 版本从未存在：404。两者都不会改动当前生效配置。
+     */
     @PostMapping("/rollback/{version}")
-    public ConfigSnapshot rollback(@PathVariable long version,
-                                   @RequestParam(defaultValue = "api") String operator) {
-        return configService.rollback(version, operator);
+    public ResponseEntity<?> rollback(@PathVariable long version,
+                                      @RequestParam(defaultValue = "api") String operator) {
+        try {
+            return ResponseEntity.ok(configService.rollback(version, operator));
+        } catch (VersionEvictedException e) {
+            return ResponseEntity.status(HttpStatus.GONE).body(Map.of(
+                    "reason", "VERSION_EVICTED",
+                    "message", e.getMessage(),
+                    "earliestAvailableVersion", e.earliestAvailableVersion(),
+                    "historyRetention", e.historyRetention()));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of(
+                    "reason", "VERSION_NOT_FOUND",
+                    "message", e.getMessage()));
+        }
     }
 
     @GetMapping("/audit")

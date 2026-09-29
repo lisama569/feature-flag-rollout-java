@@ -6,6 +6,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
@@ -49,9 +50,17 @@ public class AuditLog {
     public AuditRecord append(String changeId, String source, String operator,
                               long fromVersion, long toVersion,
                               AuditRecord.Action action, String detail, List<String> affectedKeys) {
+        return append(changeId, source, operator, fromVersion, toVersion, action, detail,
+                affectedKeys, Map.of());
+    }
+
+    public AuditRecord append(String changeId, String source, String operator,
+                              long fromVersion, long toVersion,
+                              AuditRecord.Action action, String detail,
+                              List<String> affectedKeys, Map<String, String> affectedEntries) {
         AuditRecord record = new AuditRecord(seq.incrementAndGet(), changeId, source, operator,
                 fromVersion, toVersion, action, detail,
-                List.copyOf(affectedKeys), System.currentTimeMillis());
+                List.copyOf(affectedKeys), Map.copyOf(affectedEntries), System.currentTimeMillis());
         lock.lock();
         try {
             records.addLast(record);

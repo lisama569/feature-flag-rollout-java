@@ -77,6 +77,11 @@ class FullStackIntegrationTest {
         Map<String, Object> checkoutImpact = impacts.stream()
                 .filter(f -> "new-checkout".equals(f.get("flag"))).findFirst().orElseThrow();
         assertEquals(50, ((Number) checkoutImpact.get("percentageAfter")).intValue());
+        // 预计可生效时：能拿到按当前生效版本合并后的完整预计配置
+        Map<String, String> merged = (Map<String, String>) preview.get("mergedEntries");
+        assertNotNull(merged);
+        assertEquals("true", merged.get("feature.new-checkout.enabled"));
+        assertEquals("50", merged.get("feature.new-checkout.percentage"));
 
         // 试算不应改变生效版本
         Map<String, Object> currentAfterPreview = rest.getForObject(uri("/api/config"), Map.class);
@@ -90,6 +95,11 @@ class FullStackIntegrationTest {
                 uri("/api/config/changes/preview"), jsonEntity(stalePreviewReq), Map.class);
         assertEquals(Boolean.FALSE, stalePreview.get("wouldApply"));
         assertEquals("STALE_BASE_VERSION", stalePreview.get("rejectionReason"));
+        // 被拒试算不得回带不会生效的预计值
+        assertNullish(stalePreview.get("proposedVersion"));
+        assertNullish(stalePreview.get("mergedEntries"));
+        assertTrue(((List<?>) stalePreview.get("diffs")).isEmpty());
+        assertTrue(((List<?>) stalePreview.get("affectedFlags")).isEmpty());
 
         // 5) 批次原子发布（新链路）：整批一次生效
         Map<String, Object> batchReq = Map.of(
@@ -134,6 +144,20 @@ class FullStackIntegrationTest {
         List<Map<String, Object>> auditAll = rest.getForObject(uri("/api/config/audit"), List.class);
         assertTrue(auditAll.stream().anyMatch(r -> "e2e-batch-1".equals(r.get("changeId"))
                 && "APPLIED".equals(r.get("action"))));
+        // 批次审计记录带完整键值：一条记录即可复盘整批发布了什么
+        Map<String, Object> batchAudit = auditAll.stream()
+                .filter(r -> "e2e-batch-1".equals(r.get("changeId"))
+                        && "APPLIED".equals(r.get("action")))
+                .findFirst().orElseThrow();
+        Map<String, String> batchEntries = (Map<String, String>) batchAudit.get("affectedEntries");
+        log.info("[http] batch audit -> entries={} operator={} {}->{}",
+                batchEntries, batchAudit.get("operator"),
+                batchAudit.get("fromVersion"), batchAudit.get("toVersion"));
+        assertEquals("80", batchEntries.get("feature.new-checkout.percentage"));
+        assertEquals("true", batchEntries.get("feature.checkout-v2.enabled"));
+        assertEquals("25", batchEntries.get("feature.checkout-v2.percentage"));
+        assertEquals("alice", batchAudit.get("operator"));
+        assertEquals("release-pipeline", batchAudit.get("source"));
         Map<String, Object> appliedOnly = rest.getForObject(
                 uri("/api/ops/audit?action=APPLIED&limit=5"), Map.class);
         log.info("[http] ops audit APPLIED -> returned={} truncated={}",
@@ -167,9 +191,52 @@ class FullStackIntegrationTest {
         assertNotNull(overview.get("recentLimit"));
         assertNotNull(overview.get("recentTruncated"));
         assertNotNull(overview.get("generatedAtMillis"));
+        // 版本历史保留信息在总览可见
+        assertNotNull(overview.get("historyRetention"));
+        assertNotNull(overview.get("historyRetainedVersions"));
+        assertNotNull(overview.get("historyEvictedCount"));
+        assertNotNull(overview.get("earliestRetainedVersion"));
         // 回滚后 new-checkout 总开关恢复为默认 false，总览中不应再列为打开
         List<Map<String, Object>> openFlags = (List<Map<String, Object>>) overview.get("openFlags");
         assertTrue(openFlags.stream().noneMatch(f -> "checkout-v2".equals(f.get("flag"))));
+
+        // 10) 版本历史超过保留上限后：回滚已淘汰版本 -> 410 VERSION_EVICTED（明确不可用）
+        int retention = ((Number) overview.get("historyRetention")).intValue();
+        long v = ((Number) rest.getForObject(uri("/api/config"), Map.class).get("version")).longValue();
+        for (int i = 0; i < retention + 5; i++) {
+            Map<String, Object> change = Map.of(
+                    "changeId", "e2e-churn-" + i, "source", "curl", "baseVersion", v,
+                    "entries", Map.of("feature.new-checkout.percentage", String.valueOf(i % 100)));
+            ResponseEntity<Map> resp = rest.postForEntity(uri("/api/config/changes"), jsonEntity(change), Map.class);
+            assertEquals(HttpStatus.OK, resp.getStatusCode());
+            v = ((Number) resp.getBody().get("version")).longValue();
+        }
+        Map<String, Object> overview2 = rest.getForObject(uri("/api/ops/overview"), Map.class);
+        log.info("[http] after churn -> retained={}/{} evicted={} earliest={}",
+                overview2.get("historyRetainedVersions"), overview2.get("historyRetention"),
+                overview2.get("historyEvictedCount"), overview2.get("earliestRetainedVersion"));
+        assertTrue(((Number) overview2.get("historyEvictedCount")).longValue() > 0,
+                "超过保留上限后总览必须能看到淘汰提示");
+        assertEquals(retention, ((Number) overview2.get("historyRetainedVersions")).intValue());
+
+        // 回滚到已被淘汰的版本 1：410 + 明确原因，且当前配置不变
+        ResponseEntity<Map> evictedResp = rest.exchange(
+                uri("/api/config/rollback/1?operator=oncall"),
+                org.springframework.http.HttpMethod.POST, new org.springframework.http.HttpEntity<Void>(new org.springframework.http.HttpHeaders()), Map.class);
+        log.info("[http] rollback evicted -> {} {}", evictedResp.getStatusCode(), evictedResp.getBody());
+        assertEquals(HttpStatus.GONE, evictedResp.getStatusCode());
+        assertEquals("VERSION_EVICTED", evictedResp.getBody().get("reason"));
+        assertNotNull(evictedResp.getBody().get("earliestAvailableVersion"));
+        long versionAfterEvicted = ((Number) rest.getForObject(uri("/api/config"), Map.class)
+                .get("version")).longValue();
+        assertEquals(v, versionAfterEvicted, "回滚被淘汰版本不得改动当前配置");
+
+        // 回滚到从未存在过的版本：404，与已淘汰明确区分
+        ResponseEntity<Map> missingResp = rest.exchange(
+                uri("/api/config/rollback/" + (v + 1000) + "?operator=oncall"),
+                org.springframework.http.HttpMethod.POST, new org.springframework.http.HttpEntity<Void>(new org.springframework.http.HttpHeaders()), Map.class);
+        assertEquals(HttpStatus.NOT_FOUND, missingResp.getStatusCode());
+        assertEquals("VERSION_NOT_FOUND", missingResp.getBody().get("reason"));
     }
 
     private static void assertNullish(Object value) {
